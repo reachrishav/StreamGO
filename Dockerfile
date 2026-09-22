@@ -1,14 +1,14 @@
 # syntax=docker/dockerfile:1.4
 
-# Stage 1: Build WebX SPA Frontend
 FROM node:20-alpine AS frontend-builder
 
 RUN apk add --no-cache git
 
-ARG WEBX_REPO=https://github.com/StreamXProject/WebX.git
-RUN git clone --depth 1 ${WEBX_REPO} /app/WebX
+RUN git clone https://github.com/StreamXProject/WebX.git /app/WebX
 
 WORKDIR /app/WebX
+
+RUN git checkout 34ab61569b497d34ae54ac279de5356f0417aabb
 
 RUN npm install
 RUN npm run build
