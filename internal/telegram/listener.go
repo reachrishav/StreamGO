@@ -16,6 +16,7 @@ import (
 
 	"streamgo/internal/config"
 	"streamgo/internal/database"
+	"streamgo/internal/metadata"
 )
 
 // AccessFilter checks chat access rights.
@@ -148,6 +149,8 @@ func (l *IngestionListener) handleMessage(ctx context.Context, msg *tg.Message) 
 	if title == "" {
 		title = fmt.Sprintf("Audio %d", msg.ID)
 	}
+
+	title, artist = metadata.CleanMetadata(title, artist)
 
 	// Forum topic extraction
 	var topicID int32

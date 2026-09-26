@@ -73,6 +73,7 @@ func ParseMediaInfo(output string, fallbackDurationSec int32, fileSize int64) *m
 	if artist == "" {
 		artist = audio["performer"]
 	}
+	title, artist = CleanMetadata(title, artist)
 	composer := general["composer"]
 	label := getFirst(general, "label", "publisher")
 	genre := general["genre"]

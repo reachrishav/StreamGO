@@ -212,11 +212,26 @@ func (s *EnrichmentService) enrichSingleTrack(ctx context.Context, trackID strin
 	durationSec := track.Audio.DurationSec
 	year := track.Audio.Year
 
+	cleanTitle, cleanArtist := CleanMetadata(title, artist)
+	if cleanTitle != title {
+		title = cleanTitle
+	}
+	if cleanArtist != artist {
+		artist = cleanArtist
+	}
+
 	nowTs := float64(time.Now().Unix())
 	updateFields := bson.M{
 		"enriched":    true,
 		"enriched_at": nowTs,
 		"updated_at":  nowTs,
+	}
+	if cleanTitle != track.Audio.Title {
+		updateFields["audio.title"] = cleanTitle
+	}
+	if cleanArtist != track.Audio.Artist {
+		updateFields["audio.artist"] = cleanArtist
+		updateFields["audio.artists"] = SplitArtists(cleanArtist)
 	}
 
 	// 1. Partial Media Download & MediaInfo extraction (matching Python StreamXBot)
@@ -371,6 +386,11 @@ func (s *EnrichmentService) enrichSingleTrack(ctx context.Context, trackID strin
 	// 7. Ensure titles and audio.titles are populated
 	if updateFields["titles"] == nil {
 		if len(track.Titles) > 0 {
+			cleanOriginal, _ := CleanTitle(fmt.Sprint(track.Titles["original"]), artist)
+			if cleanOriginal != "" {
+				track.Titles["original"] = cleanOriginal
+			}
+			updateFields["titles"] = track.Titles
 			updateFields["audio.titles"] = track.Titles
 		} else {
 			updateFields["titles"] = bson.M{"original": title}
