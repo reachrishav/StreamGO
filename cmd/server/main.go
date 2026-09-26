@@ -55,7 +55,14 @@ func main() {
 	lyricsSvc := services.NewLyricsEnrichmentService(cfg)
 	dedupSvc := services.NewDedupService(dbClient)
 	accessFilter := services.NewAccessFilter(cfg, dbClient)
+	r2Storage := services.NewR2StorageService(cfg)
 	enrichSvc := services.NewEnrichmentService(dbClient, coverSearch, lyricsSvc)
+	if r2Storage.IsConfigured() {
+		enrichSvc.SetR2Storage(r2Storage)
+		log.Infof("Cloudflare R2 storage configured for artwork (bucket: %s)", cfg.R2BucketName)
+	} else {
+		log.Info("Cloudflare R2 not configured; using free online artwork enrichment (iTunes/Deezer)")
+	}
 
 	if dbClient != nil {
 		workers := cfg.EnrichmentWorkers

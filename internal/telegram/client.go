@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -749,5 +750,169 @@ func (s *Service) DownloadPartialForTrack(
 func (s *Service) DownloadTrack(ctx context.Context, track *models.Track, w io.Writer) error {
 	return s.DownloadPartialForTrack(ctx, track, 0, w, nil)
 }
+
+// isImageBytes verifies if payload starts with valid JPEG, PNG, or WebP magic headers.
+func isImageBytes(data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	// JPEG: 0xFF 0xD8 0xFF
+	if data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return true
+	}
+	// PNG: 0x89 'P' 'N' 'G'
+	if data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G' {
+		return true
+	}
+	// WebP: RIFF....WEBP
+	if len(data) >= 12 && string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		return true
+	}
+	return false
+}
+
+// DownloadDocumentThumbnailForTrack downloads the standalone Telegram MTProto thumbnail for a track, if available.
+func (s *Service) DownloadDocumentThumbnailForTrack(
+	ctx context.Context,
+	track *models.Track,
+	w io.Writer,
+) error {
+	if track == nil {
+		return errors.New("track is nil")
+	}
+
+	readyWorkers := []*ClientWorker{}
+	s.mu.RLock()
+	for _, worker := range s.workers {
+		if worker.Ready {
+			readyWorkers = append(readyWorkers, worker)
+		}
+	}
+	s.mu.RUnlock()
+
+	if len(readyWorkers) == 0 {
+		return errors.New("no ready telegram workers available")
+	}
+
+	var chosenWorker *ClientWorker
+	var fileID string
+
+	// 1. Prefer a worker that already has a mapped file_id
+	if track.Telegram.FileIDs != nil {
+		for _, worker := range readyWorkers {
+			wid := strconv.FormatInt(worker.ID, 10)
+			if wid == "0" || wid == "" {
+				if parts := strings.Split(worker.Token, ":"); len(parts) > 0 {
+					wid = parts[0]
+				}
+			}
+			if fid, ok := track.Telegram.FileIDs[wid]; ok && fid != "" {
+				chosenWorker = worker
+				fileID = fid
+				atomic.AddInt64(&worker.Workload, 1)
+				break
+			}
+		}
+	}
+
+	// 2. If not matched, pick the least-loaded worker
+	if chosenWorker == nil {
+		chosenWorker = s.AcquireWorker()
+	}
+	defer s.ReleaseWorker(chosenWorker)
+
+	wid := strconv.FormatInt(chosenWorker.ID, 10)
+	if wid == "0" || wid == "" {
+		if parts := strings.Split(chosenWorker.Token, ":"); len(parts) > 0 {
+			wid = parts[0]
+		}
+	}
+
+	if fileID == "" && track.Telegram.FileIDs != nil {
+		fileID = track.Telegram.FileIDs[wid]
+	}
+
+	fetchFresh := func() (string, error) {
+		if track.CacheChatID != 0 && track.CacheMessageID != 0 {
+			f, err := chosenWorker.FetchFileIDForMessage(ctx, track.CacheChatID, track.CacheMessageID)
+			if err == nil && f != "" {
+				return f, nil
+			}
+		}
+		if track.SourceChatID != 0 && track.SourceMessageID != 0 {
+			f, err := chosenWorker.FetchFileIDForMessage(ctx, track.SourceChatID, track.SourceMessageID)
+			if err == nil && f != "" {
+				return f, nil
+			}
+		}
+		return "", errors.New("could not resolve message to fetch fresh file_id")
+	}
+
+	if fileID == "" {
+		if fresh, err := fetchFresh(); err == nil && fresh != "" {
+			fileID = fresh
+		} else {
+			fileID = track.Telegram.FileID
+		}
+	}
+
+	if fileID == "" {
+		return errors.New("no file_id available for track")
+	}
+
+	doDownloadThumb := func(fid string) error {
+		decoded, err := DecodeFileID(fid)
+		if err != nil {
+			return fmt.Errorf("failed to decode file_id: %w", err)
+		}
+
+		thumbSizes := []string{"m", "s", "x", "y"}
+		var lastErr error
+
+		for _, size := range thumbSizes {
+			loc := &tg.InputDocumentFileLocation{
+				ID:            decoded.MediaID,
+				AccessHash:    decoded.AccessHash,
+				FileReference: decoded.FileReference,
+				ThumbSize:     size,
+			}
+
+			dl := chosenWorker.Client.Downloader().WithPartSize(64 * 1024)
+			var buf bytes.Buffer
+			// Cap thumbnail download to 256KB to avoid streaming entire audio files
+			cappedWriter := &partialWriter{
+				w:      &buf,
+				remain: 256 * 1024,
+			}
+			_, dlErr := dl.Download(chosenWorker.API, loc).Stream(ctx, cappedWriter)
+			if dlErr == nil || errors.Is(dlErr, io.EOF) {
+				data := buf.Bytes()
+				if len(data) > 0 && isImageBytes(data) {
+					_, writeErr := io.Copy(w, &buf)
+					return writeErr
+				}
+			}
+			lastErr = dlErr
+		}
+		if lastErr == nil {
+			lastErr = errors.New("no document thumbnail found")
+		}
+		return lastErr
+	}
+
+	err := doDownloadThumb(fileID)
+	if err != nil {
+		errStr := err.Error()
+		if strings.Contains(errStr, "FILE_REFERENCE") || strings.Contains(errStr, "400") {
+			if fresh, refreshErr := fetchFresh(); refreshErr == nil && fresh != "" {
+				fileID = fresh
+				err = doDownloadThumb(fileID)
+			}
+		}
+	}
+
+	return err
+}
+
 
 

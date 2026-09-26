@@ -47,6 +47,13 @@ type Config struct {
 	GuestPassword            string
 	AlacCacheMaxBytes        int64
 	AlacCacheMaxFiles        int
+
+	// Cloudflare R2 / S3 Blob Storage (Optional)
+	R2AccountID       string
+	R2AccessKeyID     string
+	R2SecretAccessKey string
+	R2BucketName      string
+	R2PublicURL       string
 }
 
 // Load reads configuration from .env file (if present) and environment variables.
@@ -132,7 +139,17 @@ func Load() *Config {
 		GuestPassword:            getEnv("GUEST_PASSWORD", ""),
 		AlacCacheMaxBytes:        getEnvInt64("ALAC_CACHE_MAX_BYTES", 5*1024*1024*1024),
 		AlacCacheMaxFiles:        getEnvInt("ALAC_CACHE_MAX_FILES", 200),
+		R2AccountID:              getEnv("R2_ACCOUNT_ID", ""),
+		R2AccessKeyID:            getEnv("R2_ACCESS_KEY_ID", ""),
+		R2SecretAccessKey:        getEnv("R2_SECRET_ACCESS_KEY", ""),
+		R2BucketName:             getEnv("R2_BUCKET_NAME", ""),
+		R2PublicURL:              strings.TrimRight(getEnv("R2_PUBLIC_URL", ""), "/"),
 	}
+}
+
+// HasR2 returns true if all necessary Cloudflare R2 credentials are provided.
+func (c *Config) HasR2() bool {
+	return c.R2AccountID != "" && c.R2AccessKeyID != "" && c.R2SecretAccessKey != "" && c.R2BucketName != ""
 }
 
 func parseIDList(raw string) []int64 {
@@ -175,7 +192,9 @@ func parseIDList(raw string) []int64 {
 
 func getEnv(key, defaultVal string) string {
 	if val, ok := os.LookupEnv(key); ok && strings.TrimSpace(val) != "" {
-		return strings.TrimSpace(val)
+		v := strings.TrimSpace(val)
+		v = strings.Trim(v, "\"'")
+		return v
 	}
 	return defaultVal
 }
