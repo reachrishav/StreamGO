@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ var logEnrich = logger.New("enrichment")
 type MediaDownloader interface {
 	DownloadPartialByFileID(ctx context.Context, fileID string, maxBytes int64, w io.Writer) error
 	DownloadPartialForTrack(ctx context.Context, track *models.Track, maxBytes int64, w io.Writer, onRefreshed func(botID, fileID string)) error
+	DownloadDocumentThumbnailForTrack(ctx context.Context, track *models.Track, w io.Writer) error
 }
 
 // EnrichmentService runs background worker goroutines to enrich track metadata.
@@ -309,24 +311,48 @@ func (s *EnrichmentService) enrichSingleTrack(ctx context.Context, trackID strin
 					logEnrich.Warnf("mediainfo failed on %s: %v", trackID, err)
 				}
 
-				// C. Extract Embedded Master Artwork if R2 storage is configured
+				// C. Extract Artwork if R2 storage is configured
 				if s.r2Storage != nil && s.r2Storage.IsConfigured() {
 					albumID := track.Audio.AlbumID
 					if albumID == "" && album != "" {
 						albumID = GenerateAlbumID(album, year)
 					}
 
-					// Sibling check: If album already has an R2 cover, reuse it directly
+					// Sibling check: If album already has R2 covers cached, reuse them directly
 					if albumID != "" {
-						if existingURL := s.r2Storage.GetAlbumCover(albumID); existingURL != "" {
-							updateFields["spotify.cover_url"] = existingURL
-							updateFields["spotify.big_cover_url"] = existingURL
+						if cachedCover, cachedBigCover := s.r2Storage.GetAlbumCovers(albumID); cachedCover != "" || cachedBigCover != "" {
+							if cachedCover != "" {
+								updateFields["spotify.cloudflare_cover_url"] = cachedCover
+							}
+							if cachedBigCover != "" {
+								updateFields["spotify.cloudflare_big_cover_url"] = cachedBigCover
+							}
 							updateFields["spotify.cover_source"] = "r2_telegram"
 						}
 					}
 
-					// If not cached, extract from the downloaded partial chunk
-					if updateFields["spotify.cover_url"] == nil {
+					// If not cached, extract MTProto thumbnail and/or embedded master artwork
+					if updateFields["spotify.cloudflare_cover_url"] == nil && updateFields["spotify.cloudflare_big_cover_url"] == nil {
+						var r2ThumbURL, r2BigURL string
+
+						// 1. Fetch fast MTProto thumbnail (for list previews)
+						if s.downloader != nil {
+							var thumbBuf bytes.Buffer
+							if dlThumbErr := s.downloader.DownloadDocumentThumbnailForTrack(ctx, &track, &thumbBuf); dlThumbErr == nil && thumbBuf.Len() > 0 {
+								thumbBytes := thumbBuf.Bytes()
+								thumbHash := sha256Hex(thumbBytes)
+								uploadedThumb, upErr := s.r2Storage.UploadCover(ctx, thumbHash, thumbBytes, "image/jpeg")
+								if upErr == nil && uploadedThumb != "" {
+									r2ThumbURL = uploadedThumb
+									updateFields["spotify.cloudflare_cover_url"] = r2ThumbURL
+									logEnrich.Infof("Enriched track %s with R2 MTProto preview thumbnail (%s)", trackID, r2ThumbURL)
+								} else if upErr != nil {
+									logEnrich.Warnf("Failed to upload MTProto thumbnail to R2 for track %s: %v", trackID, upErr)
+								}
+							}
+						}
+
+						// 2. Extract embedded master artwork from partial chunk (for high-res playback screens)
 						chunkBytes, readErr := os.ReadFile(tmpPath)
 						if readErr == nil && len(chunkBytes) > 0 {
 							formatHint := track.Audio.Type
@@ -335,25 +361,41 @@ func (s *EnrichmentService) enrichSingleTrack(ctx context.Context, trackID strin
 							}
 							artBytes, _, extractErr := s.artworkSvc.ExtractArtwork(chunkBytes, formatHint)
 							if extractErr == nil && len(artBytes) > 0 {
-								// Compress to WebP (1000x1000, Q=80)
+								// Compress master artwork to WebP (1000x1000, Q=80)
 								webpBytes, compErr := s.artworkSvc.CompressToWebP(ctx, artBytes, 1000, 80)
 								if compErr == nil && len(webpBytes) > 0 {
 									artHash := sha256Hex(webpBytes)
-									r2URL, uploadErr := s.r2Storage.UploadCover(ctx, artHash, webpBytes, "image/webp")
-									if uploadErr == nil && r2URL != "" {
-										updateFields["spotify.cover_url"] = r2URL
-										updateFields["spotify.big_cover_url"] = r2URL
-										updateFields["spotify.cover_source"] = "r2_telegram"
-										if albumID != "" {
-											s.r2Storage.SetAlbumCover(albumID, r2URL)
-										}
-										logEnrich.Infof("Enriched track %s with R2 master artwork (%s)", trackID, r2URL)
-									} else if uploadErr != nil {
-										logEnrich.Warnf("Failed to upload artwork to R2 for track %s: %v", trackID, uploadErr)
+									uploadedBig, upErr := s.r2Storage.UploadCover(ctx, artHash, webpBytes, "image/webp")
+									if upErr == nil && uploadedBig != "" {
+										r2BigURL = uploadedBig
+										updateFields["spotify.cloudflare_big_cover_url"] = r2BigURL
+										logEnrich.Infof("Enriched track %s with R2 master artwork (%s)", trackID, r2BigURL)
+									} else if upErr != nil {
+										logEnrich.Warnf("Failed to upload master artwork to R2 for track %s: %v", trackID, upErr)
 									}
 								} else if compErr != nil {
-									logEnrich.Warnf("Failed to compress artwork to WebP for track %s: %v", trackID, compErr)
+									logEnrich.Warnf("Failed to compress master artwork to WebP for track %s: %v", trackID, compErr)
 								}
+
+								// If no MTProto thumbnail was available, create a 300x300 preview WebP from master artwork
+								if r2ThumbURL == "" {
+									previewBytes, prevErr := s.artworkSvc.CompressToWebP(ctx, artBytes, 300, 75)
+									if prevErr == nil && len(previewBytes) > 0 {
+										prevHash := sha256Hex(previewBytes)
+										uploadedPrev, upPrevErr := s.r2Storage.UploadCover(ctx, prevHash, previewBytes, "image/webp")
+										if upPrevErr == nil && uploadedPrev != "" {
+											r2ThumbURL = uploadedPrev
+											updateFields["spotify.cloudflare_cover_url"] = r2ThumbURL
+										}
+									}
+								}
+							}
+						}
+
+						if r2ThumbURL != "" || r2BigURL != "" {
+							updateFields["spotify.cover_source"] = "r2_telegram"
+							if albumID != "" {
+								s.r2Storage.SetAlbumCovers(albumID, r2ThumbURL, r2BigURL)
 							}
 						}
 					}
@@ -383,8 +425,8 @@ func (s *EnrichmentService) enrichSingleTrack(ctx context.Context, trackID strin
 	}
 
 	// 4. Fetch cover art if missing (stores in spotify, NEVER in audio)
-	// If R2 is not configured or embedded extraction did not find artwork, fallback to iTunes / Deezer
-	if track.Spotify.CoverURL == "" && updateFields["spotify.cover_url"] == nil {
+	// If R2 is not configured or artwork was not found, fallback to iTunes / Deezer
+	if track.Spotify.CoverURL == "" && track.Spotify.CloudflareCoverURL == "" && updateFields["spotify.cover_url"] == nil && updateFields["spotify.cloudflare_cover_url"] == nil {
 		coverURL, _, err := s.coverSearch.FindBestCover(ctx, title, artist, album)
 		if err == nil && coverURL != "" {
 			updateFields["spotify.cover_url"] = coverURL
@@ -492,8 +534,12 @@ func (s *EnrichmentService) enrichSingleTrack(ctx context.Context, trackID strin
 	// 11. Update album entity incrementally
 	if album != "" && s.albumsCol != nil {
 		albumID := GenerateAlbumID(album, year)
-		bestCover := track.EffectiveCoverURL()
-		if c, ok := updateFields["spotify.cover_url"].(string); ok && c != "" {
+		bestCover := track.EffectiveBigCoverURL()
+		if c, ok := updateFields["spotify.cloudflare_big_cover_url"].(string); ok && c != "" {
+			bestCover = c
+		} else if c, ok := updateFields["spotify.cloudflare_cover_url"].(string); ok && c != "" {
+			bestCover = c
+		} else if c, ok := updateFields["spotify.cover_url"].(string); ok && c != "" {
 			bestCover = c
 		}
 		albumUpdate := bson.M{

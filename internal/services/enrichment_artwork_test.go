@@ -102,7 +102,7 @@ func TestEnrichment_ExtractCompressAndUpload(t *testing.T) {
 		httpClient: &http.Client{
 			Transport: mockClient,
 		},
-		albumCoverCache: make(map[string]string),
+		albumCoverCache: make(map[string]AlbumCovers),
 	}
 
 	hash := sha256Hex(webpBytes)

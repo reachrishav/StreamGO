@@ -243,6 +243,8 @@ func ExtractFLACPicture(data []byte) ([]byte, string, int, int, error) {
 }
 
 // ExtractID3Picture extracts the APIC (attached picture) frame from ID3v2 tag bytes.
+// Supports both ID3v2.3 (32-bit big-endian frame size) and ID3v2.4 (28-bit syncsafe frame size),
+// respects declared image MIME types (e.g. image/png vs image/jpeg), and cleanly truncates at image EOF.
 func ExtractID3Picture(data []byte) ([]byte, string, error) {
 	apicIdx := bytes.Index(data, []byte("APIC"))
 	if apicIdx == -1 {
@@ -256,19 +258,20 @@ func ExtractID3Picture(data []byte) ([]byte, string, error) {
 		return nil, "", fmt.Errorf("truncated APIC header")
 	}
 
-	frameSize := int(binary.BigEndian.Uint32(frameHeader[4:8]))
-	if apicIdx+10+frameSize > len(data) {
-		// Attempt to scan for JPEG magic within available slice
-		payload := frameHeader[10:]
-		if jpegStart := bytes.Index(payload, []byte("\xff\xd8\xff")); jpegStart != -1 {
-			if jpegEnd := bytes.Index(payload[jpegStart:], []byte("\xff\xd9")); jpegEnd != -1 {
-				return payload[jpegStart : jpegStart+jpegEnd+2], "image/jpeg", nil
-			}
-		}
-		return nil, "", fmt.Errorf("APIC frame payload truncated")
+	// Check ID3 major version (ID3v2.4 uses syncsafe frame sizes)
+	isV4 := len(data) >= 4 && data[0] == 'I' && data[1] == 'D' && data[2] == '3' && data[3] == 4
+	var frameSize int
+	if isV4 {
+		b := frameHeader[4:8]
+		frameSize = int(b[0]&0x7F)<<21 | int(b[1]&0x7F)<<14 | int(b[2]&0x7F)<<7 | int(b[3]&0x7F)
+	} else {
+		frameSize = int(binary.BigEndian.Uint32(frameHeader[4:8]))
 	}
 
-	payload := frameHeader[10 : 10+frameSize]
+	payload := frameHeader[10:]
+	if frameSize > 0 && 10+frameSize <= len(frameHeader) {
+		payload = frameHeader[10 : 10+frameSize]
+	}
 	if len(payload) < 4 {
 		return nil, "", fmt.Errorf("APIC payload too short")
 	}
@@ -283,20 +286,53 @@ func ExtractID3Picture(data []byte) ([]byte, string, error) {
 	if mimeEnd == -1 {
 		return nil, "", fmt.Errorf("corrupt APIC mime terminator")
 	}
-	mime := string(payload[1 : 1+mimeEnd])
-	if mime == "image/jpg" {
-		mime = "image/jpeg"
+	mime := strings.ToLower(string(payload[1 : 1+mimeEnd]))
+
+	var imgStart int = -1
+	var detectedMime string
+
+	// Respect declared MIME type first to avoid false-positive matches
+	// (e.g. \xff\xd8\xff occurring inside PNG deflate streams)
+	if strings.Contains(mime, "png") {
+		if pIdx := bytes.Index(payload, []byte("\x89PNG\r\n\x1a\n")); pIdx != -1 {
+			imgStart = pIdx
+			detectedMime = "image/png"
+		}
+	} else if strings.Contains(mime, "jpeg") || strings.Contains(mime, "jpg") {
+		if jIdx := bytes.Index(payload, []byte("\xff\xd8\xff")); jIdx != -1 {
+			imgStart = jIdx
+			detectedMime = "image/jpeg"
+		}
 	}
 
-	// Search for image magic bytes (JPEG \xff\xd8\xff or PNG \x89PNG)
-	jpegStart := bytes.Index(payload, []byte("\xff\xd8\xff"))
-	if jpegStart != -1 {
-		return payload[jpegStart:], "image/jpeg", nil
-	}
-	pngStart := bytes.Index(payload, []byte("\x89PNG"))
-	if pngStart != -1 {
-		return payload[pngStart:], "image/png", nil
+	// Fallback to whichever valid image header appears first
+	if imgStart == -1 {
+		pIdx := bytes.Index(payload, []byte("\x89PNG\r\n\x1a\n"))
+		jIdx := bytes.Index(payload, []byte("\xff\xd8\xff"))
+		if pIdx != -1 && (jIdx == -1 || pIdx < jIdx) {
+			imgStart = pIdx
+			detectedMime = "image/png"
+		} else if jIdx != -1 {
+			imgStart = jIdx
+			detectedMime = "image/jpeg"
+		}
 	}
 
-	return nil, "", fmt.Errorf("could not locate image magic bytes in APIC frame")
+	if imgStart == -1 {
+		return nil, "", fmt.Errorf("could not locate image magic bytes in APIC frame")
+	}
+
+	rawImg := payload[imgStart:]
+	// Truncate at image EOF marker if present to avoid trailing garbage
+	if detectedMime == "image/png" {
+		if endIdx := bytes.Index(rawImg, []byte("IEND")); endIdx != -1 && endIdx+8 <= len(rawImg) {
+			rawImg = rawImg[:endIdx+8]
+		}
+	} else if detectedMime == "image/jpeg" {
+		if endIdx := bytes.Index(rawImg, []byte("\xff\xd9")); endIdx != -1 {
+			rawImg = rawImg[:endIdx+2]
+		}
+	}
+
+	return rawImg, detectedMime, nil
 }

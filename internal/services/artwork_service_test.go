@@ -84,3 +84,99 @@ func TestArtworkService_CompressToWebP(t *testing.T) {
 		t.Fatal("Output does not have valid WebP magic header")
 	}
 }
+
+func TestArtworkService_ExtractID3Picture_PNG_Syncsafe(t *testing.T) {
+	// 1. Construct PNG payload that contains \xff\xd8\xff in its body
+	pngPayload := []byte("\x89PNG\r\n\x1a\n")
+	pngPayload = append(pngPayload, []byte("fake_chunk_data_with_\xff\xd8\xff_embedded_in_stream")...)
+	pngPayload = append(pngPayload, []byte("IEND\xae\x42\x60\x82")...)
+
+	// APIC payload: [encoding: 1B] [mime: null-terminated] [picType: 1B] [desc: null-terminated] [image data]
+	var apicPayload bytes.Buffer
+	apicPayload.WriteByte(0) // ISO-8859-1
+	apicPayload.WriteString("image/png\x00")
+	apicPayload.WriteByte(3) // Cover (front)
+	apicPayload.WriteString("Cover Art\x00")
+	apicPayload.Write(pngPayload)
+
+	payloadBytes := apicPayload.Bytes()
+	frameLen := len(payloadBytes)
+
+	// In ID3v2.4, frame size is syncsafe (7 bits per byte)
+	syncsafeLen := []byte{
+		byte((frameLen >> 21) & 0x7F),
+		byte((frameLen >> 14) & 0x7F),
+		byte((frameLen >> 7) & 0x7F),
+		byte(frameLen & 0x7F),
+	}
+
+	var tag bytes.Buffer
+	// ID3v2.4 Header (10 bytes)
+	tag.WriteString("ID3")
+	tag.WriteByte(4) // v2.4
+	tag.WriteByte(0) // revision
+	tag.WriteByte(0) // flags
+	tag.Write([]byte{0, 0, 0x10, 0}) // tag size syncsafe
+
+	// APIC Frame Header (10 bytes)
+	tag.WriteString("APIC")
+	tag.Write(syncsafeLen)
+	tag.Write([]byte{0, 0}) // flags
+	tag.Write(payloadBytes)
+
+	// Trailing audio / frame data
+	tag.WriteString("TRAILING_AUDIO_DATA_OR_NEXT_FRAME")
+
+	extracted, mime, err := ExtractID3Picture(tag.Bytes())
+	if err != nil {
+		t.Fatalf("ExtractID3Picture failed: %v", err)
+	}
+	if mime != "image/png" {
+		t.Fatalf("Expected image/png, got %s", mime)
+	}
+	if !bytes.Equal(extracted, pngPayload) {
+		t.Fatalf("Extracted payload did not match expected PNG (len %d vs %d)", len(extracted), len(pngPayload))
+	}
+}
+
+func TestArtworkService_ExtractID3Picture_JPEG_V23(t *testing.T) {
+	testJPEG := createTestJPEG(50, 50)
+
+	var apicPayload bytes.Buffer
+	apicPayload.WriteByte(0)
+	apicPayload.WriteString("image/jpeg\x00")
+	apicPayload.WriteByte(3)
+	apicPayload.WriteString("Cover\x00")
+	apicPayload.Write(testJPEG)
+
+	payloadBytes := apicPayload.Bytes()
+	frameLen := uint32(len(payloadBytes))
+
+	var tag bytes.Buffer
+	// ID3v2.3 Header (10 bytes)
+	tag.WriteString("ID3")
+	tag.WriteByte(3) // v2.3
+	tag.WriteByte(0)
+	tag.WriteByte(0)
+	tag.Write([]byte{0, 0, 0x10, 0})
+
+	// APIC Frame Header (10 bytes) - standard 32-bit big endian length
+	tag.WriteString("APIC")
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], frameLen)
+	tag.Write(lenBuf[:])
+	tag.Write([]byte{0, 0})
+	tag.Write(payloadBytes)
+	tag.WriteString("TRAILING_MP3_AUDIO_STREAM_BYTES")
+
+	extracted, mime, err := ExtractID3Picture(tag.Bytes())
+	if err != nil {
+		t.Fatalf("ExtractID3Picture failed: %v", err)
+	}
+	if mime != "image/jpeg" {
+		t.Fatalf("Expected image/jpeg, got %s", mime)
+	}
+	if !bytes.Equal(extracted, testJPEG) {
+		t.Fatalf("Extracted JPEG did not match expected (len %d vs %d)", len(extracted), len(testJPEG))
+	}
+}

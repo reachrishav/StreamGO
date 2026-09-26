@@ -504,7 +504,7 @@ func (r *mongoArtistAlbumRepository) RefreshAlbumsCache(ctx context.Context, lim
 			"_id":            "$_aid",
 			"title":          bson.M{"$first": "$_album_title"},
 			"artist":         bson.M{"$first": "$_album_artist"},
-			"cover_url":      bson.M{"$first": bson.M{"$ifNull": []any{"$spotify.big_cover_url", "$spotify.cover_url"}}},
+			"cover_url":      bson.M{"$first": bson.M{"$ifNull": []any{"$spotify.cloudflare_big_cover_url", "$spotify.cloudflare_cover_url", "$spotify.big_cover_url", "$spotify.cover_url"}}},
 			"year":           bson.M{"$first": "$_year"},
 			"tracks_count":   bson.M{"$sum": 1},
 			"duration_total": bson.M{"$sum": bson.M{"$ifNull": []any{"$audio.duration_sec", 0}}},

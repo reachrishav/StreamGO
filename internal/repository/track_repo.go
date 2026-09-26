@@ -313,9 +313,9 @@ func (r *mongoTrackRepository) GetTopics(ctx context.Context, channelID int64, l
 			"_id":            "$topic_name",
 			"topic_id":       bson.M{"$first": "$topic_id"},
 			"source_chat_id": bson.M{"$first": "$source_chat_id"},
-			"cover_url":      bson.M{"$first": "$spotify.cover_url"},
-			"big_cover_url":  bson.M{"$first": "$spotify.big_cover_url"},
-			"raw_thumbnails": bson.M{"$push": "$spotify.cover_url"},
+			"cover_url":      bson.M{"$first": bson.M{"$ifNull": []any{"$spotify.cloudflare_cover_url", "$spotify.cover_url"}}},
+			"big_cover_url":  bson.M{"$first": bson.M{"$ifNull": []any{"$spotify.cloudflare_big_cover_url", "$spotify.big_cover_url", "$spotify.cover_url"}}},
+			"raw_thumbnails": bson.M{"$push": bson.M{"$ifNull": []any{"$spotify.cloudflare_cover_url", "$spotify.cover_url"}}},
 			"tracks_count":   bson.M{"$sum": 1},
 		}}},
 		bson.D{{Key: "$project", Value: bson.M{

@@ -18,6 +18,12 @@ import (
 
 var logR2 = logger.New("r2_storage")
 
+// AlbumCovers holds cached public R2 URLs for preview and master covers.
+type AlbumCovers struct {
+	CoverURL    string // lightweight thumbnail for list previews
+	BigCoverURL string // master 1000x1000 artwork
+}
+
 // R2StorageService provides optional Cloudflare R2 / S3-compatible blob storage
 // for persistent, CDN-delivered artwork thumbnails.
 type R2StorageService struct {
@@ -29,14 +35,14 @@ type R2StorageService struct {
 	httpClient      *http.Client
 
 	mu              sync.RWMutex
-	albumCoverCache map[string]string // albumID -> publicCoverURL
+	albumCoverCache map[string]AlbumCovers // albumID -> AlbumCovers
 }
 
 // NewR2StorageService creates a new R2StorageService from application config.
 func NewR2StorageService(cfg *config.Config) *R2StorageService {
 	if cfg == nil || !cfg.HasR2() {
 		return &R2StorageService{
-			albumCoverCache: make(map[string]string),
+			albumCoverCache: make(map[string]AlbumCovers),
 		}
 	}
 
@@ -55,7 +61,7 @@ func NewR2StorageService(cfg *config.Config) *R2StorageService {
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
-		albumCoverCache: make(map[string]string),
+		albumCoverCache: make(map[string]AlbumCovers),
 	}
 }
 
@@ -64,14 +70,29 @@ func (s *R2StorageService) IsConfigured() bool {
 	return s != nil && s.accountID != "" && s.accessKeyID != "" && s.secretAccessKey != "" && s.bucketName != ""
 }
 
-// GetAlbumCover returns the cached public R2 cover URL for an album, if present.
+// GetAlbumCover returns the cached public R2 master/big cover URL for an album, if present.
 func (s *R2StorageService) GetAlbumCover(albumID string) string {
 	if albumID == "" {
 		return ""
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.albumCoverCache[albumID]
+	entry := s.albumCoverCache[albumID]
+	if entry.BigCoverURL != "" {
+		return entry.BigCoverURL
+	}
+	return entry.CoverURL
+}
+
+// GetAlbumCovers returns the cached preview thumbnail and master artwork R2 URLs for an album.
+func (s *R2StorageService) GetAlbumCovers(albumID string) (coverURL, bigCoverURL string) {
+	if albumID == "" {
+		return "", ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry := s.albumCoverCache[albumID]
+	return entry.CoverURL, entry.BigCoverURL
 }
 
 // SetAlbumCover caches the public R2 cover URL for an album.
@@ -81,10 +102,53 @@ func (s *R2StorageService) SetAlbumCover(albumID, coverURL string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.albumCoverCache[albumID] = coverURL
+	entry := s.albumCoverCache[albumID]
+	entry.BigCoverURL = coverURL
+	if entry.CoverURL == "" {
+		entry.CoverURL = coverURL
+	}
+	s.albumCoverCache[albumID] = entry
+}
+
+// SetAlbumCovers caches both the preview and master R2 cover URLs for an album.
+func (s *R2StorageService) SetAlbumCovers(albumID, coverURL, bigCoverURL string) {
+	if albumID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.albumCoverCache[albumID] = AlbumCovers{
+		CoverURL:    coverURL,
+		BigCoverURL: bigCoverURL,
+	}
+}
+
+// MaxCoverPayloadBytes defines the maximum allowed file size for cover art uploads (5 MB).
+const MaxCoverPayloadBytes = 5 * 1024 * 1024
+
+// DetectImageFormat inspects magic header bytes to determine image MIME type and file extension.
+// Returns ok=false if data does not match known image formats (JPEG, PNG, WebP).
+func DetectImageFormat(data []byte) (mimeType string, ext string, ok bool) {
+	if len(data) < 4 {
+		return "", "", false
+	}
+	// JPEG: 0xFF 0xD8 0xFF
+	if data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return "image/jpeg", "jpg", true
+	}
+	// PNG: 0x89 'P' 'N' 'G'
+	if data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G' {
+		return "image/png", "png", true
+	}
+	// WebP: RIFF....WEBP
+	if len(data) >= 12 && string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		return "image/webp", "webp", true
+	}
+	return "", "", false
 }
 
 // UploadCover uploads artwork bytes to Cloudflare R2 using standard S3 SigV4 authentication.
+// Rejects non-image payloads (audio files, corrupt streams) and oversized payloads > 5 MB.
 // Returns the public CDN URL for the uploaded object.
 func (s *R2StorageService) UploadCover(ctx context.Context, hash string, data []byte, contentType string) (string, error) {
 	if !s.IsConfigured() {
@@ -93,10 +157,21 @@ func (s *R2StorageService) UploadCover(ctx context.Context, hash string, data []
 	if len(data) == 0 {
 		return "", fmt.Errorf("cannot upload empty data")
 	}
+	if len(data) > MaxCoverPayloadBytes {
+		return "", fmt.Errorf("refusing to upload oversized cover (%d bytes, max %d bytes)", len(data), MaxCoverPayloadBytes)
+	}
 
-	ext := "webp"
-	if contentType == "image/jpeg" {
-		ext = "jpg"
+	detectedMime, ext, isImg := DetectImageFormat(data)
+	if !isImg {
+		preview := data
+		if len(preview) > 8 {
+			preview = preview[:8]
+		}
+		return "", fmt.Errorf("refusing to upload non-image payload to R2 (detected header: %x)", preview)
+	}
+
+	if contentType == "" {
+		contentType = detectedMime
 	}
 	key := fmt.Sprintf("covers/%s.%s", hash, ext)
 
@@ -108,9 +183,6 @@ func (s *R2StorageService) UploadCover(ctx context.Context, hash string, data []
 		return "", fmt.Errorf("failed to create upload request: %w", err)
 	}
 
-	if contentType == "" {
-		contentType = "image/webp"
-	}
 	cacheControl := "public, max-age=31536000, immutable"
 
 	req.Header.Set("Content-Type", contentType)
@@ -134,6 +206,38 @@ func (s *R2StorageService) UploadCover(ctx context.Context, hash string, data []
 	publicURL := fmt.Sprintf("%s/%s", s.publicURL, key)
 	logR2.Infof("Successfully uploaded artwork to R2: %s (%.1f KB)", key, float64(len(data))/1024.0)
 	return publicURL, nil
+}
+
+// DeleteCover removes an artwork object from Cloudflare R2 bucket.
+func (s *R2StorageService) DeleteCover(ctx context.Context, key string) error {
+	if !s.IsConfigured() {
+		return fmt.Errorf("r2 storage is not configured")
+	}
+	key = strings.TrimPrefix(key, "/")
+	endpointHost := fmt.Sprintf("%s.r2.cloudflarestorage.com", s.accountID)
+	reqURL := fmt.Sprintf("https://%s/%s/%s", endpointHost, s.bucketName, key)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create delete request: %w", err)
+	}
+	req.Header.Set("Host", endpointHost)
+
+	now := time.Now().UTC()
+	signS3Request(req, nil, s.accessKeyID, s.secretAccessKey, "auto", "s3", now)
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("r2 delete request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("r2 delete returned status %d", resp.StatusCode)
+	}
+
+	logR2.Infof("Successfully deleted artwork from R2: %s", key)
+	return nil
 }
 
 // signS3Request signs an HTTP request using AWS Signature Version 4 (SigV4).

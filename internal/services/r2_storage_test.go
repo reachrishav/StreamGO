@@ -93,10 +93,11 @@ func TestR2StorageService_UploadMock(t *testing.T) {
 		httpClient: &http.Client{
 			Transport: mockTransport,
 		},
-		albumCoverCache: make(map[string]string),
+		albumCoverCache: make(map[string]AlbumCovers),
 	}
 
-	url, err := svc.UploadCover(context.Background(), "hash123", []byte("sample-data"), "image/webp")
+	validWebP := append([]byte("RIFF\x20\x00\x00\x00WEBPVP8 "), []byte("sample-payload-bytes")...)
+	url, err := svc.UploadCover(context.Background(), "hash123", validWebP, "image/webp")
 	if err != nil {
 		t.Fatalf("UploadCover failed: %v", err)
 	}
@@ -112,6 +113,97 @@ func TestR2StorageService_UploadMock(t *testing.T) {
 	}
 	if receivedContentType != "image/webp" {
 		t.Fatalf("Unexpected Content-Type: %s", receivedContentType)
+	}
+}
+
+func TestR2StorageService_RejectsNonImageAndOversized(t *testing.T) {
+	svc := &R2StorageService{
+		accountID:       "test-account",
+		accessKeyID:     "test-key",
+		secretAccessKey: "test-secret",
+		bucketName:      "test-bucket",
+		publicURL:       "https://cdn.example.com",
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			}),
+		},
+	}
+
+	ctx := context.Background()
+
+	// 1. Rejects MP3 audio starting with ID3
+	mp3Payload := []byte("ID3\x04\x00\x00\x00\x00\x00audio-tag-bytes")
+	if _, err := svc.UploadCover(ctx, "hash_mp3", mp3Payload, "image/jpeg"); err == nil {
+		t.Fatal("Expected error when uploading MP3 audio bytes, got nil")
+	}
+
+	// 2. Rejects M4A audio starting with ftyp
+	m4aPayload := []byte("\x00\x00\x00\x1cftypM4A \x00\x00\x00\x00")
+	if _, err := svc.UploadCover(ctx, "hash_m4a", m4aPayload, "image/jpeg"); err == nil {
+		t.Fatal("Expected error when uploading M4A audio bytes, got nil")
+	}
+
+	// 3. Rejects FLAC audio starting with fLaC
+	flacPayload := []byte("fLaC\x00\x00\x00\x22audio-data")
+	if _, err := svc.UploadCover(ctx, "hash_flac", flacPayload, "image/jpeg"); err == nil {
+		t.Fatal("Expected error when uploading FLAC audio bytes, got nil")
+	}
+
+	// 4. Rejects oversized payload > 5MB
+	oversized := make([]byte, MaxCoverPayloadBytes+1)
+	oversized[0], oversized[1], oversized[2] = 0xFF, 0xD8, 0xFF // valid JPEG header but oversized
+	if _, err := svc.UploadCover(ctx, "hash_big", oversized, "image/jpeg"); err == nil {
+		t.Fatal("Expected error when uploading oversized payload, got nil")
+	}
+
+	// 5. Accepts genuine JPEG
+	validJPEG := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00}
+	url, err := svc.UploadCover(ctx, "valid_jpeg", validJPEG, "")
+	if err != nil {
+		t.Fatalf("Expected valid JPEG to succeed, got %v", err)
+	}
+	if !strings.HasSuffix(url, ".jpg") {
+		t.Fatalf("Expected .jpg extension for JPEG, got %s", url)
+	}
+}
+
+func TestR2StorageService_DeleteCoverMock(t *testing.T) {
+	var receivedMethod string
+	var receivedKey string
+
+	mockTransport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		receivedMethod = req.Method
+		receivedKey = req.URL.Path
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Body:       io.NopCloser(strings.NewReader("")),
+		}, nil
+	})
+
+	svc := &R2StorageService{
+		accountID:       "test-account",
+		accessKeyID:     "test-key",
+		secretAccessKey: "test-secret",
+		bucketName:      "test-bucket",
+		publicURL:       "https://cdn.example.com",
+		httpClient: &http.Client{
+			Transport: mockTransport,
+		},
+	}
+
+	err := svc.DeleteCover(context.Background(), "covers/bad_audio.jpg")
+	if err != nil {
+		t.Fatalf("DeleteCover failed: %v", err)
+	}
+	if receivedMethod != http.MethodDelete {
+		t.Fatalf("Expected HTTP DELETE, got %s", receivedMethod)
+	}
+	if receivedKey != "/test-bucket/covers/bad_audio.jpg" {
+		t.Fatalf("Unexpected S3 key path: %s", receivedKey)
 	}
 }
 
