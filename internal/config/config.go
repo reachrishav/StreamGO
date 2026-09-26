@@ -192,7 +192,9 @@ func parseIDList(raw string) []int64 {
 
 func getEnv(key, defaultVal string) string {
 	if val, ok := os.LookupEnv(key); ok && strings.TrimSpace(val) != "" {
-		return strings.TrimSpace(val)
+		v := strings.TrimSpace(val)
+		v = strings.Trim(v, "\"'")
+		return v
 	}
 	return defaultVal
 }
