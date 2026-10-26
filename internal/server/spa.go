@@ -98,6 +98,7 @@ func isAPIOrReservedPath(path string) bool {
 		"/docs",
 		"/redoc",
 		"/openapi.json",
+		"/youtubei",
 	}
 	for _, p := range prefixes {
 		if path == p || strings.HasPrefix(path, p+"/") {
