@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,6 +93,51 @@ func New(cfg *config.Config, db *database.Client, tg *telegram.Service, filter *
 	r.Head("/redoc", s.handleRedoc)
 	r.Get("/openapi.json", s.handleOpenAPISpec)
 	r.Head("/openapi.json", s.handleOpenAPISpec)
+
+	// YouTube Music InnerTube Reverse Proxy (for client-side lyrics fetching without browser CORS restrictions)
+	ytTarget, _ := url.Parse("https://music.youtube.com")
+	ytProxy := httputil.NewSingleHostReverseProxy(ytTarget)
+	origDirector := ytProxy.Director
+	ytProxy.Director = func(req *http.Request) {
+		origDirector(req)
+		req.Host = "music.youtube.com"
+		req.Header.Set("Origin", "https://music.youtube.com")
+		req.Header.Set("Referer", "https://music.youtube.com/")
+		req.Header.Set("X-Origin", "https://music.youtube.com")
+		req.Header.Set("X-YouTube-Client-Name", "67")
+		req.Header.Set("X-YouTube-Client-Version", "1.20250101.01.00")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	}
+	r.HandleFunc("/youtubei/*", func(w http.ResponseWriter, req *http.Request) {
+		ytProxy.ServeHTTP(w, req)
+	})
+
+	// KuGou Music Reverse Proxy (for client-side lyrics fetching without browser CORS restrictions)
+	kgSearchTarget, _ := url.Parse("https://mobileservice.kugou.com")
+	kgSearchProxy := httputil.NewSingleHostReverseProxy(kgSearchTarget)
+	origKgSearchDirector := kgSearchProxy.Director
+	kgSearchProxy.Director = func(req *http.Request) {
+		origKgSearchDirector(req)
+		req.Host = "mobileservice.kugou.com"
+		req.Header.Set("User-Agent", "piTube/1.0")
+	}
+	r.HandleFunc("/kugou/search/*", func(w http.ResponseWriter, req *http.Request) {
+		req.URL.Path = strings.TrimPrefix(req.URL.Path, "/kugou/search")
+		kgSearchProxy.ServeHTTP(w, req)
+	})
+
+	kgLyricsTarget, _ := url.Parse("http://lyrics.kugou.com")
+	kgLyricsProxy := httputil.NewSingleHostReverseProxy(kgLyricsTarget)
+	origKgLyricsDirector := kgLyricsProxy.Director
+	kgLyricsProxy.Director = func(req *http.Request) {
+		origKgLyricsDirector(req)
+		req.Host = "lyrics.kugou.com"
+		req.Header.Set("User-Agent", "piTube/1.0")
+	}
+	r.HandleFunc("/kugou/lyrics/*", func(w http.ResponseWriter, req *http.Request) {
+		req.URL.Path = strings.TrimPrefix(req.URL.Path, "/kugou/lyrics")
+		kgLyricsProxy.ServeHTTP(w, req)
+	})
 
 	// Mount Domain Routes when MongoDB is available
 	if db != nil {
